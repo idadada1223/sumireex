@@ -22,6 +22,22 @@ import com.kazumaproject.markdownhelperkeyboard.user_dictionary.database.UserWor
 import com.kazumaproject.markdownhelperkeyboard.user_template.database.UserTemplate
 import com.kazumaproject.markdownhelperkeyboard.user_template.database.UserTemplateDao
 
+/**
+ * アプリケーションのRoomデータベース定義。
+ *
+ * このデータベースには以下のエンティティ（テーブル）が含まれます：
+ * - [LearnEntity]: 学習辞書の単語情報。
+ * - [ClickedSymbol]: 最近使用した記号の履歴。
+ * - [UserWord]: ユーザー辞書の単語情報。
+ * - [CustomKeyboardLayout]: カスタムキーボードのレイアウト情報。
+ * - [KeyDefinition]: カスタムキーボードの各キーの定義。
+ * - [FlickMapping]: カスタムキーボードのフリック入力のマッピング情報。
+ * - [UserTemplate]: ユーザー定義の定型文。
+ * - [ClipboardHistoryItem]: クリップボードの履歴アイテム。
+ *
+ * 現在のデータベースバージョンは9です。
+ * スキーマのエクスポートは無効化されています（`exportSchema = false`）。
+ */
 @Database(
     entities = [
         LearnEntity::class,
@@ -36,19 +52,36 @@ import com.kazumaproject.markdownhelperkeyboard.user_template.database.UserTempl
     version = 9,
     exportSchema = false
 )
+/**
+ * 型コンバータを指定します。
+ * Roomデータベースはデフォルトでは特定の型（例: Bitmap）を直接保存できないため、
+ * これらのコンバータクラスが型の変換を行います。
+ * - [BitmapConverter]: BitmapとByteArray間の変換。
+ * - [ItemTypeConverter]: クリップボードアイテムの種別（テキスト、画像など）のEnumとString間の変換。
+ */
 @TypeConverters(
     BitmapConverter::class,
     ItemTypeConverter::class
 )
 abstract class AppDatabase : RoomDatabase() {
+    /** 学習辞書 ([LearnEntity]) にアクセスするためのDAOを取得します。 */
     abstract fun learnDao(): LearnDao
+    /** 最近使用した記号 ([ClickedSymbol]) にアクセスするためのDAOを取得します。 */
     abstract fun clickedSymbolDao(): ClickedSymbolDao
+    /** ユーザー辞書 ([UserWord]) にアクセスするためのDAOを取得します。 */
     abstract fun userWordDao(): UserWordDao
+    /** カスタムキーボードレイアウト ([CustomKeyboardLayout], [KeyDefinition], [FlickMapping]) にアクセスするためのDAOを取得します。 */
     abstract fun keyboardLayoutDao(): KeyboardLayoutDao
+    /** ユーザー定義の定型文 ([UserTemplate]) にアクセスするためのDAOを取得します。 */
     abstract fun userTemplateDao(): UserTemplateDao
+    /** クリップボード履歴 ([ClipboardHistoryItem]) にアクセスするためのDAOを取得します。 */
     abstract fun clipboardHistoryDao(): ClipboardHistoryDao
 
     companion object {
+        /**
+         * データベースバージョン1から2へのマイグレーション。
+         * `clicked_symbol_history` テーブル（最近使用した記号の履歴）を作成します。
+         */
         val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
@@ -64,6 +97,10 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * データベースバージョン2から3へのマイグレーション。
+         * `user_word` テーブル（ユーザー辞書）を作成します。
+         */
         val MIGRATION_2_3 = object : Migration(2, 3) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
@@ -81,9 +118,9 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
-         * The new migration from version 3 to 4.
-         * This migration adds an index to the `reading` column of the `user_word` table
-         * to significantly improve query performance for prefix searches.
+         * データベースバージョン3から4へのマイグレーション。
+         * `user_word` テーブルの `reading` カラムにインデックスを作成し、
+         * 読みによる前方一致検索のパフォーマンスを向上させます。
          */
         val MIGRATION_3_4 = object : Migration(3, 4) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -93,9 +130,11 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
-         * バージョン4から5へのマイグレーション。
-         * ユーザーによるキーボードレイアウトのカスタマイズ機能をサポートするため、
-         * 3つの新しいテーブル (keyboard_layouts, key_definitions, flick_mappings) を追加します。
+         * データベースバージョン4から5へのマイグレーション。
+         * カスタムキーボード機能をサポートするため、以下の3つのテーブルを作成します。
+         * - `keyboard_layouts`: キーボードレイアウト全体の情報。
+         * - `key_definitions`: 各キーの定義情報。`keyboard_layouts` への外部キーを含む。
+         * - `flick_mappings`: フリック入力のマッピング情報。`key_definitions` への外部キーを含む。
          */
         val MIGRATION_4_5 = object : Migration(4, 5) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -152,8 +191,8 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
-         * バージョン5から6へのマイグレーション。
-         * key_definitions テーブルに action 列を追加します。
+         * データベースバージョン5から6へのマイグレーション。
+         * `key_definitions` テーブルに `action` カラムを追加します。
          * この列は、キーが持つ特別な機能（削除、スペースなど）を文字列として保存します。
          */
         val MIGRATION_5_6 = object : Migration(5, 6) { // <<< ★★★ ここから追加 ★★★
@@ -163,9 +202,9 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
-         * バージョン6から7へのマイグレーション。
-         * 定型文機能をサポートするため、user_template テーブルを追加します。
-         * 検索パフォーマンス向上のため、reading列にインデックスも作成します。
+         * データベースバージョン6から7へのマイグレーション。
+         * 定型文機能をサポートするため、`user_template` テーブルを追加します。
+         * 検索パフォーマンス向上のため、`reading` カラムにインデックスも作成します。
          */
         val MIGRATION_6_7 = object : Migration(6, 7) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -187,8 +226,8 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
-         * バージョン7から8へのマイグレーション。
-         * learn_table に leftId と rightId カラムを追加します。
+         * データベースバージョン7から8へのマイグレーション。
+         * `learn_table` に `leftId` と `rightId` カラムを追加します。
          * これらは連接コスト計算のために使用されます。
          * SQLiteではShort型はINTEGERとして扱われ、デフォルト値はNULLとなります。
          */
@@ -199,7 +238,10 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
-        // バージョン8から9へのマイグレーション例
+        /**
+         * データベースバージョン8から9へのマイグレーション。
+         * クリップボード履歴機能をサポートするため、`clipboard_history` テーブルを追加します。
+         */
         val MIGRATION_8_9 = object : Migration(8, 9) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(

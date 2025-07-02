@@ -145,87 +145,94 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 
+// AndroidEntryPointアノテーションにより、Hiltによる依存性注入が可能になります。
 @AndroidEntryPoint
+// IMEServiceクラスはInputMethodServiceを継承し、LifecycleOwner, InputConnection, ClipboardHistoryToggleListenerインターフェースを実装します。
+// これにより、IMEとしての基本機能、ライフサイクル管理、入力接続処理、クリップボード履歴のトグル機能を提供します。
 class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
     ClipboardHistoryToggleListener {
 
+    // Hiltによる依存性注入: 各種リポジトリ、設定、エンジンなどが注入されます。
     @Inject
-    lateinit var learnMultiple: LearnMultiple
-
-    @Inject
-    lateinit var appPreference: AppPreference
+    lateinit var learnMultiple: LearnMultiple // 複数単語の学習処理を担当
 
     @Inject
-    lateinit var inputMethodManager: InputMethodManager
+    lateinit var appPreference: AppPreference // アプリケーションの設定を管理
 
     @Inject
-    lateinit var kanaKanjiEngine: KanaKanjiEngine
+    lateinit var inputMethodManager: InputMethodManager // システムのInputMethodManager
 
     @Inject
-    lateinit var englishEngine: EnglishEngine
+    lateinit var kanaKanjiEngine: KanaKanjiEngine // かな漢字変換エンジン
 
     @Inject
-    lateinit var learnRepository: LearnRepository
+    lateinit var englishEngine: EnglishEngine // 英語入力エンジン
 
     @Inject
-    lateinit var userDictionaryRepository: UserDictionaryRepository
+    lateinit var learnRepository: LearnRepository // 学習辞書リポジトリ
 
     @Inject
-    lateinit var userTemplateRepository: UserTemplateRepository
+    lateinit var userDictionaryRepository: UserDictionaryRepository // ユーザー辞書リポジトリ
 
     @Inject
-    lateinit var clickedSymbolRepository: ClickedSymbolRepository
+    lateinit var userTemplateRepository: UserTemplateRepository // ユーザテンプレートリポジトリ
 
     @Inject
-    lateinit var clipboardHistoryRepository: ClipboardHistoryRepository
+    lateinit var clickedSymbolRepository: ClickedSymbolRepository // クリックされた記号の履歴リポジトリ
 
     @Inject
-    lateinit var keyboardRepository: KeyboardRepository
+    lateinit var clipboardHistoryRepository: ClipboardHistoryRepository // クリップボード履歴リポジトリ
 
     @Inject
-    lateinit var clipboardUtil: ClipboardUtil
+    lateinit var keyboardRepository: KeyboardRepository // キーボードレイアウトリポジトリ
 
     @Inject
-    lateinit var romajiConverter: RomajiKanaConverter
+    lateinit var clipboardUtil: ClipboardUtil // クリップボード操作ユーティリティ
 
-    private lateinit var clipboardManager: ClipboardManager
+    @Inject
+    lateinit var romajiConverter: RomajiKanaConverter // ローマ字かな変換処理
 
+    private lateinit var clipboardManager: ClipboardManager // システムのClipboardManager
+
+    // クリップボード履歴機能が有効かどうかを示すフラグ
     private var isClipboardHistoryFeatureEnabled: Boolean = false
+    // クリップボード処理の競合を防ぐためのMutex
     private val clipboardMutex = Mutex()
 
     /**
      * クリップボードの内容が変更されたときに呼び出されるリスナー。
+     * 新しいアイテムを検出し、重複がなければ履歴に保存します。
      */
     private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
         ioScope.launch {
-            // ▼▼▼ Mutexで処理ブロックをロックする ▼▼▼
-            clipboardMutex.withLock {
+            clipboardMutex.withLock { // クリティカルセクションへのアクセスを同期
                 // 1. 現在クリップボードにあるアイテムを取得
                 val newItem = clipboardUtil.getPrimaryClipContent()
-                val newHistoryItem = newItem.toHistoryItem() ?: return@withLock
+                val newHistoryItem = newItem.toHistoryItem() ?: return@withLock // 履歴アイテムに変換できなければ終了
 
                 // 2. DBに保存されている最新のアイテムを取得
                 val lastSavedItem = clipboardHistoryRepository.getLatestItem()
 
                 // 3. 最新アイテムと比較して、内容が重複していないかチェック
                 val isDuplicate = if (lastSavedItem == null) {
-                    false
+                    false // 履歴が空なら重複なし
                 } else {
+                    // アイテムタイプと内容が一致するかどうかで重複を判断
                     if (newHistoryItem.itemType == lastSavedItem.itemType) {
                         when (newHistoryItem.itemType) {
                             ItemType.TEXT -> newHistoryItem.textData == lastSavedItem.textData
                             ItemType.IMAGE -> newHistoryItem.imageData?.sameAs(lastSavedItem.imageData)
-                                ?: false
+                                ?: false // 画像データがnullでない場合、内容を比較
                         }
                     } else {
-                        false
+                        false // アイテムタイプが異なれば重複なし
                     }
                 }
 
                 // 4. 重複していなければ、DBに挿入する
                 if (!isDuplicate) {
                     Timber.d("LOCKED: New clipboard item detected. Inserting to history.")
-                    if (isClipboardHistoryFeatureEnabled) {
+                    if (isClipboardHistoryFeatureEnabled) { // クリップボード履歴機能が有効な場合のみ保存
                         clipboardHistoryRepository.insert(newHistoryItem)
                     }
                 } else {
@@ -235,87 +242,144 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
         }
     }
 
+    // 候補表示用のアダプター
     private var suggestionAdapter: SuggestionAdapter? = null
 
+    // UI操作用のコルーチンスコープ (メインスレッド)
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    // IO操作用のコルーチンスコープ (IOスレッド)
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    // 各種シンボルや絵文字のキャッシュ
     private var cachedEmoji: List<Emoji>? = null
     private var cachedEmoticons: List<String>? = null
     private var cachedSymbols: List<String>? = null
     private var cachedClickedSymbolHistory: List<ClickedSymbol>? = null
+    // 現在のクリップボードアイテムのリスト
     private var currentClipboardItems: List<ClipboardItem> = emptyList()
 
+    // 各種長押し処理用のJob
     private var deleteLongPressJob: Job? = null
     private var rightLongPressJob: Job? = null
     private var leftLongPressJob: Job? = null
 
+    // メインレイアウトのビューバインディング
     private var mainLayoutBinding: MainLayoutBinding? = null
+    // 現在入力中の文字列を保持するStateFlow
     private val _inputString = MutableStateFlow("")
-    private val inputString = _inputString.asStateFlow()
+    val inputString = _inputString.asStateFlow() // 外部公開用の読み取り専用StateFlow
+    // 変換後に残った未変換文字列 (例: "こんにちは"で「こんにち」を変換した場合の「は」)
     private var stringInTail = AtomicReference("")
+    // 濁点キーが押されているかどうかの状態
     private val _dakutenPressed = MutableStateFlow(false)
+    // 候補表示の状態を示すSharedFlow (Idle: 非表示, Updating: 更新中)
     private val _suggestionFlag = MutableSharedFlow<CandidateShowFlag>(replay = 0)
-    private val suggestionFlag = _suggestionFlag.asSharedFlow()
+    val suggestionFlag = _suggestionFlag.asSharedFlow()
+    // 候補表示ビューの表示/非表示状態
     private val _suggestionViewStatus = MutableStateFlow(true)
-    private val suggestionViewStatus = _suggestionViewStatus.asStateFlow()
+    val suggestionViewStatus = _suggestionViewStatus.asStateFlow()
+    // シンボルキーボードの表示/非表示状態
     private val _keyboardSymbolViewState = MutableStateFlow(false)
-    private val keyboardSymbolViewState: StateFlow<Boolean> = _keyboardSymbolViewState.asStateFlow()
+    val keyboardSymbolViewState: StateFlow<Boolean> = _keyboardSymbolViewState.asStateFlow()
+    // テンキー/QWERTYキーボードのモード状態
     private val _tenKeyQWERTYMode = MutableStateFlow<TenKeyQWERTYMode>(TenKeyQWERTYMode.Default)
-    private val qwertyMode = _tenKeyQWERTYMode.asStateFlow()
+    val qwertyMode = _tenKeyQWERTYMode.asStateFlow()
+    // 現在の入力フィールドのタイプ (テキスト、数値、メールアドレスなど)
     private var currentInputType: InputTypeForIME = InputTypeForIME.Text
+    // フリック入力後に次のひらがなに変換されたかどうか
     private val lastFlickConvertedNextHiragana = AtomicBoolean(false)
+    // 連続タップ入力が有効かどうか (例: 「あ」を連続タップで「い」「う」…)
     private val isContinuousTapInputEnabled = AtomicBoolean(false)
+    // 英語入力モードでスペースキーが押されたかどうか
     private val englishSpaceKeyPressed = AtomicBoolean(false)
+    // 候補がクリックされた回数 (変換候補の選択に使用)
     private var suggestionClickNum = 0
+    // 現在変換中かどうか
     private val isHenkan = AtomicBoolean(false)
+    // 左カーソルキーの長押しが離されたかどうか
     private val onLeftKeyLongPressUp = AtomicBoolean(false)
+    // 右カーソルキーの長押しが離されたかどうか
     private val onRightKeyLongPressUp = AtomicBoolean(false)
+    // 削除キーの長押しが離されたかどうか
     private val onDeleteLongPressUp = AtomicBoolean(false)
+    // 削除キーが長押しされているかどうか
     private val deleteKeyLongKeyPressed = AtomicBoolean(false)
+    // 右カーソルキーが長押しされているかどうか
     private val rightCursorKeyLongKeyPressed = AtomicBoolean(false)
+    // 左カーソルキーが長押しされているかどうか
     private val leftCursorKeyLongKeyPressed = AtomicBoolean(false)
+
+    // 設定項目: フリック入力のみを有効にするか
     private var isFlickOnlyMode: Boolean? = false
+    // 設定項目: 同音連続入力の遅延時間
     private var delayTime: Int? = 1000
+    // 設定項目: 学習辞書を有効にするか
     private var isLearnDictionaryMode: Boolean? = false
+    // 設定項目: ユーザー辞書を有効にするか
     private var isUserDictionaryEnable: Boolean? = false
+    // 設定項目: ユーザーテンプレートを有効にするか
     private var isUserTemplateEnable: Boolean? = false
+    // 設定項目: スペースキーで半角スペースを入力するか
     private var hankakuPreference: Boolean? = false
+    // 設定項目: ライブ変換を有効にするか
     private var isLiveConversionEnable: Boolean? = false
+    // 設定項目: 候補表示数
     private var nBest: Int? = 4
+    // 設定項目: バイブレーションを有効にするか
     private var isVibration: Boolean? = true
+    // 設定項目: バイブレーションのタイミング ("both", "press", "release")
     private var vibrationTimingStr: String? = "both"
+    // 設定項目: Mozc UT辞書 (人名) を有効にするか
     private var mozcUTPersonName: Boolean? = false
+    // 設定項目: Mozc UT辞書 (地名) を有効にするか
     private var mozcUTPlaces: Boolean? = false
+    // 設定項目: Mozc UT辞書 (Wikipedia) を有効にするか
     private var mozcUTWiki: Boolean? = false
+    // 設定項目: Mozc UT辞書 (Neologd) を有効にするか
     private var mozcUTNeologd: Boolean? = false
+    // 設定項目: Mozc UT辞書 (Web) を有効にするか
     private var mozcUTWeb: Boolean? = false
+    // 設定項目: Sumireキーボードの入力タイプ ("flick-default" など)
     private var sumireInputKeyType: String? = "flick-default"
+    // 設定項目: シンボルキーボードの初期表示タブ (絵文字、顔文字など)
     private var symbolKeyboardFirstItem: SymbolMode? = SymbolMode.EMOJI
 
+    // タブレット端末かどうか
     private var isTablet: Boolean? = false
 
+    // キーボードビューを格納するコンテナ
     private var keyboardContainer: FrameLayout? = null
 
+    // スペースキーが長押しされているかどうか
     private var isSpaceKeyLongPressed = false
+    // テキスト選択モードかどうか
     private val _selectMode = MutableStateFlow(false)
-    private val selectMode: StateFlow<Boolean> = _selectMode
+    val selectMode: StateFlow<Boolean> = _selectMode
 
+    // カーソル移動モードかどうか (スペースキー長押しで発動)
     private val _cursorMoveMode = MutableStateFlow(false)
-    private val cursorMoveMode: StateFlow<Boolean> = _cursorMoveMode
+    val cursorMoveMode: StateFlow<Boolean> = _cursorMoveMode
+    // カタカナに変換済みかどうか (スペースキー長押しでのトグルに使用)
     private var hasConvertedKatakana = false
 
+    // 削除された文字を一時的に保持するバッファ (Undo機能用)
     private val deletedBuffer = StringBuilder()
 
+    // 設定されたキーボードの表示順序
     private var keyboardOrder: List<KeyboardType> = emptyList()
 
+    // カスタムキーボードのレイアウトリスト
     private var customLayouts: List<CustomKeyboardLayout> = emptyList()
 
+    // 現在のナイトモードの状態
     private var currentNightMode: Int = 0
 
+    // 候補のキャッシュ (キー: 入力文字列, 値: 候補リスト)
     private var suggestionCache: MutableMap<String, List<Candidate>>? = null
+    // ライフサイクル管理用のレジストリ
     private lateinit var lifecycleRegistry: LifecycleRegistry
 
+    // 各種キーアイコンのキャッシュ (Drawable)
     private val cachedSpaceDrawable: Drawable? by lazy {
         ContextCompat.getDrawable(
             applicationContext, com.kazumaproject.core.R.drawable.baseline_space_bar_24
@@ -387,6 +451,7 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
         )
     }
 
+    // ひらがな入力モードのデフォルトレイアウト
     private val hiraganaLayout: KeyboardLayout? by lazy {
         KeyboardDefaultLayouts.createFinalLayout(
             mode = KeyboardInputMode.HIRAGANA,
@@ -398,28 +463,43 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
     }
 
     companion object {
-        private const val LONG_DELAY_TIME = 64L
-        private const val DEFAULT_DELAY_MS = 1000L
-        private const val LIVE_CONVERSION_QUICK_DELAY_MS = 128L
-        private const val QUICK_DELAY_THRESHOLD_MS = 100
+        // 長押し関連の遅延時間 (ミリ秒)
+        private const val LONG_DELAY_TIME = 64L // 長押し時の連続処理間隔
+        private const val DEFAULT_DELAY_MS = 1000L // ライブ変換のデフォルト遅延
+        private const val LIVE_CONVERSION_QUICK_DELAY_MS = 128L // ライブ変換のクイック遅延
+        private const val QUICK_DELAY_THRESHOLD_MS = 100 // クイック遅延と判断する閾値
     }
 
+    /**
+     * IMEサービスが作成されるときに呼び出されます。
+     * ライフサイクル管理、候補アダプターの初期化、クリップボードリスナーの登録などを行います。
+     */
     override fun onCreate() {
         super.onCreate()
         Timber.d("onCreate")
-        lifecycleRegistry = LifecycleRegistry(this)
-        lifecycleRegistry.currentState = Lifecycle.State.CREATED
+        lifecycleRegistry = LifecycleRegistry(this) // ライフサイクルレジストリの初期化
+        lifecycleRegistry.currentState = Lifecycle.State.CREATED // ライフサイクル状態をCREATEDに設定
+
+        // 候補表示用アダプターの初期化とコールバック設定
         suggestionAdapter = SuggestionAdapter().apply {
-            onListUpdated = {
+            onListUpdated = { // 候補リストが更新されたら先頭にスクロール
                 mainLayoutBinding?.suggestionRecyclerView?.scrollToPosition(0)
             }
         }
+        // 現在のナイトモードを取得
         currentNightMode = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+        // ClipboardManagerの取得とリスナー登録
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboardManager.addPrimaryClipChangedListener(clipboardListener)
+        // クリップボード履歴機能の有効状態をプリファレンスから読み込み
         isClipboardHistoryFeatureEnabled = appPreference.clipboard_history_enable ?: false
     }
 
+    /**
+     * 入力ビュー（キーボードのUI）が作成されるときに呼び出されます。
+     * レイアウトのインフレート、リスナーの設定などを行います。
+     * 既存のビューがある場合は再利用し、ない場合は新規に作成します。
+     */
     override fun onCreateInputView(): View? {
         Timber.d("onCreateInputView")
         // もしコンテナがすでに存在している場合、システムが再追加できるように
@@ -432,29 +512,30 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
         // 作成とセットアップを行う。
         if (keyboardContainer == null) {
             Timber.d("Creating keyboardContainer for the first time.")
-            isTablet = resources.getBoolean(com.kazumaproject.core.R.bool.isTablet)
-            keyboardContainer = FrameLayout(this)
+            isTablet = resources.getBoolean(com.kazumaproject.core.R.bool.isTablet) // タブレットかどうかを判定
+            keyboardContainer = FrameLayout(this) // キーボードコンテナを生成
 
             // コンテナの内部にキーボードのUIをセットアップする
             setupKeyboardView()
             // 初回のみ実行したい他のセットアップ処理
-            appPreference.keyboard_order.let { keyboardTypes ->
-                if (keyboardTypes.contains(KeyboardType.CUSTOM)) {
-                    ioScope.launch {
+            appPreference.keyboard_order.let { keyboardTypes -> // 設定されたキーボード順序を取得
+                if (keyboardTypes.contains(KeyboardType.CUSTOM)) { // カスタムキーボードが含まれていれば
+                    ioScope.launch { // IOスコープで非同期にレイアウトを読み込み
                         customLayouts = keyboardRepository.getLayoutsNotFlow()
                     }
                 }
             }
 
+            // メインレイアウトのビューバインディングが存在し、ライフサイクルがCREATEDならスコープを開始
             mainLayoutBinding?.let { mainView ->
                 if (lifecycle.currentState == Lifecycle.State.CREATED) {
                     startScope(mainView)
-                } else {
+                } else { // それ以外の場合は既存のコルーチンをキャンセルして再開
                     scope.coroutineContext.cancelChildren()
                     startScope(mainView)
                 }
             }
-        } else {
+        } else { // コンテナが既に存在する場合は、キーボードビューの再セットアップとスコープの再開のみ
             setupKeyboardView()
             scope.coroutineContext.cancelChildren()
             mainLayoutBinding?.let { mainView ->
@@ -464,21 +545,31 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
         return keyboardContainer
     }
 
+    /**
+     * 新しい入力が開始されるとき、または既存の入力が再開されるときに呼び出されます。
+     * 設定の読み込み、各種フラグのリセット、辞書の初期化などを行います。
+     * @param attribute 新しい入力ターゲットのEditorInfo。nullの場合もあります。
+     * @param restarting trueの場合、同じクライアント内での再起動を示します。
+     */
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
         super.onStartInput(attribute, restarting)
         Timber.d("onUpdate onStartInput called $restarting")
-        resetAllFlags()
-        if (suggestionCache == null) {
+        resetAllFlags() // 全ての内部状態フラグをリセット
+        if (suggestionCache == null) { // 候補キャッシュがなければ初期化
             suggestionCache = mutableMapOf()
         }
-        _suggestionViewStatus.update { true }
+        _suggestionViewStatus.update { true } // 候補表示ビューをデフォルトで表示状態に
+
+        // アプリケーション設定を読み込み、対応する内部状態を更新
         appPreference.apply {
-            keyboardOrder = keyboard_order
+            keyboardOrder = keyboard_order // キーボードの表示順序
+            // Mozc UT辞書の有効状態
             mozcUTPersonName = mozc_ut_person_names_preference ?: false
             mozcUTPlaces = mozc_ut_places_preference ?: false
             mozcUTWiki = mozc_ut_wiki_preference ?: false
             mozcUTNeologd = mozc_ut_neologd_preference ?: false
             mozcUTWeb = mozc_ut_web_preference ?: false
+            // 入力モード関連の設定
             isFlickOnlyMode = flick_input_only_preference ?: false
             delayTime = time_same_pronounce_typing_preference ?: 1000
             isLearnDictionaryMode = learn_dictionary_preference ?: true
@@ -487,77 +578,87 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
             hankakuPreference = space_hankaku_preference ?: false
             isLiveConversionEnable = live_conversion_preference ?: false
             nBest = n_best_preference ?: 4
+            // バイブレーション設定
             isVibration = vibration_preference ?: true
             vibrationTimingStr = vibration_timing_preference ?: "both"
+            // Sumireキーボード、シンボルキーボードの設定
             sumireInputKeyType = sumire_input_selection_preference ?: "flick-default"
             symbolKeyboardFirstItem = symbol_mode_preference
+
+            // 各種Mozc UT辞書が有効であれば、初期化されていなければビルドする
             if (mozcUTPersonName == true) {
                 if (!kanaKanjiEngine.isMozcUTPersonDictionariesInitialized()) {
-                    kanaKanjiEngine.buildPersonNamesDictionary(
-                        applicationContext
-                    )
+                    kanaKanjiEngine.buildPersonNamesDictionary(applicationContext)
                 }
             }
             if (mozcUTPlaces == true) {
                 if (!kanaKanjiEngine.isMozcUTPlacesDictionariesInitialized()) {
-                    kanaKanjiEngine.buildPlaceDictionary(
-                        applicationContext
-                    )
+                    kanaKanjiEngine.buildPlaceDictionary(applicationContext)
                 }
             }
             if (mozcUTWiki == true) {
                 if (!kanaKanjiEngine.isMozcUTWikiDictionariesInitialized()) {
-                    kanaKanjiEngine.buildWikiDictionary(
-                        applicationContext
-                    )
+                    kanaKanjiEngine.buildWikiDictionary(applicationContext)
                 }
             }
             if (mozcUTNeologd == true) {
                 if (!kanaKanjiEngine.isMozcUTNeologdDictionariesInitialized()) {
-                    kanaKanjiEngine.buildNeologdDictionary(
-                        applicationContext
-                    )
+                    kanaKanjiEngine.buildNeologdDictionary(applicationContext)
                 }
             }
             if (mozcUTWeb == true) {
                 if (!kanaKanjiEngine.isMozcUTWebDictionariesInitialized()) {
-                    kanaKanjiEngine.buildWebDictionary(
-                        applicationContext
-                    )
+                    kanaKanjiEngine.buildWebDictionary(applicationContext)
                 }
             }
         }
     }
 
+    /**
+     * 入力ビューが表示される直前に呼び出されます。
+     * 現在の入力タイプの設定、クリップボードプレビューの更新、キーボードサイズの設定、キーボードのリセットを行います。
+     * @param editorInfo 現在の入力ターゲットに関する情報。
+     * @param restarting trueの場合、同じクライアント内で入力ビューが再開されることを示します。
+     */
     override fun onStartInputView(editorInfo: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(editorInfo, restarting)
         Timber.d("onUpdate onStartInputView called $restarting")
-        setCurrentInputType(editorInfo)
-        updateClipboardPreview()
-        setKeyboardSize()
-        resetKeyboard()
+        setCurrentInputType(editorInfo) // 現在の入力フィールドのタイプを設定
+        updateClipboardPreview() // クリップボードのプレビューを更新
+        setKeyboardSize() // キーボードのサイズを設定
+        resetKeyboard() // キーボードの状態をリセット
     }
 
+    /**
+     * 入力が終了するときに呼び出されます。
+     * 全てのフラグをリセットします。
+     */
     override fun onFinishInput() {
         super.onFinishInput()
         Timber.d("onUpdate onFinishInput Called")
-        resetAllFlags()
+        resetAllFlags() // 全ての内部状態フラグをリセット
     }
 
+    /**
+     * 入力ビューが非表示になる直前に呼び出されます。
+     * キーボードの表示状態をデフォルトに戻します。
+     * @param finishingInput trueの場合、入力セッション全体が終了することを示します。
+     */
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
         Timber.d("onUpdate onFinishInputView")
+        // タブレットと通常端末でキーボードの表示状態を調整
         if (isTablet == true) {
             mainLayoutBinding?.tabletView?.isVisible = true
             mainLayoutBinding?.keyboardView?.isVisible = false
         } else {
-            if (qwertyMode.value == TenKeyQWERTYMode.Default) {
+            if (qwertyMode.value == TenKeyQWERTYMode.Default) { // デフォルトモードの場合
                 mainLayoutBinding?.apply {
                     qwertyView.isVisible = false
                     keyboardView.isVisible = true
                     tabletView.isVisible = false
                 }
-            } else {
+            } else { // QWERTYモードなどの場合
                 mainLayoutBinding?.apply {
                     qwertyView.isVisible = true
                     keyboardView.isVisible = false
@@ -565,23 +666,29 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
                 }
             }
         }
-        mainLayoutBinding?.suggestionRecyclerView?.isVisible = true
+        mainLayoutBinding?.suggestionRecyclerView?.isVisible = true // 候補表示ビューを表示
     }
 
+    /**
+     * IMEサービスが破棄されるときに呼び出されます。
+     * リソースの解放、リスナーの解除、キャッシュのクリアなどを行います。
+     */
     override fun onDestroy() {
         Timber.d("onUpdate onDestroy")
         super.onDestroy()
-        suggestionAdapter?.release()
+        suggestionAdapter?.release() // 候補アダプターのリソース解放
         suggestionAdapter = null
-        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
-        suggestionCache = null
-        clearSymbols()
-        clipboardManager.removePrimaryClipChangedListener(clipboardListener)
+        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED // ライフサイクル状態をDESTROYEDに設定
+        suggestionCache = null // 候補キャッシュをクリア
+        clearSymbols() // シンボルキャッシュをクリア
+        clipboardManager.removePrimaryClipChangedListener(clipboardListener) // クリップボードリスナーを解除
+        // 各種Mozc UT辞書のリソース解放
         if (mozcUTPersonName == true) kanaKanjiEngine.releasePersonNamesDictionary()
         if (mozcUTPlaces == true) kanaKanjiEngine.releasePlacesDictionary()
         if (mozcUTWiki == true) kanaKanjiEngine.releaseWikiDictionary()
         if (mozcUTNeologd == true) kanaKanjiEngine.releaseNeologdDictionary()
         if (mozcUTWeb == true) kanaKanjiEngine.releaseWebDictionary()
+        // 設定関連の変数をnullに設定
         isFlickOnlyMode = null
         delayTime = null
         isLearnDictionaryMode = null
@@ -600,75 +707,76 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
         sumireInputKeyType = null
         isTablet = null
         symbolKeyboardFirstItem = null
-        actionInDestroy()
-        System.gc()
+        actionInDestroy() // 破棄時の追加アクションを実行
+        System.gc() // ガベージコレクションを要求
     }
 
+    /**
+     * IMEのウィンドウが非表示になったときに呼び出されます。
+     * キーボードモードや表示状態をデフォルトに戻します。
+     */
     override fun onWindowHidden() {
         super.onWindowHidden()
-        _tenKeyQWERTYMode.update { TenKeyQWERTYMode.Default }
-        _keyboardSymbolViewState.update { false }
-        _selectMode.update { false }
-        _cursorMoveMode.update { false }
+        _tenKeyQWERTYMode.update { TenKeyQWERTYMode.Default } // キーボードモードをデフォルトに
+        _keyboardSymbolViewState.update { false } // シンボルキーボードを非表示に
+        _selectMode.update { false } // 選択モードを解除
+        _cursorMoveMode.update { false } // カーソル移動モードを解除
     }
 
+    /**
+     * デバイスのコンフィギュレーション（画面の向きなど）が変更されたときに呼び出されます。
+     * 必要に応じて変換中のテキストを確定し、ナイトモードの変更に対応します。
+     */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        // 画面の向きが変更された場合、変換中のテキストを確定
         when (newConfig.orientation) {
-            Configuration.ORIENTATION_PORTRAIT -> {
-                finishComposingText()
-                setComposingText("", 0)
-            }
-
-            Configuration.ORIENTATION_LANDSCAPE -> {
-                finishComposingText()
-                setComposingText("", 0)
-            }
-
+            Configuration.ORIENTATION_PORTRAIT,
+            Configuration.ORIENTATION_LANDSCAPE,
             Configuration.ORIENTATION_UNDEFINED -> {
                 finishComposingText()
                 setComposingText("", 0)
             }
-
             else -> {
                 finishComposingText()
                 setComposingText("", 0)
             }
         }
 
+        // ナイトモードが変更された場合、キーボードビューを再セットアップ
         val newNightMode = newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK
-
         if (newNightMode != currentNightMode) {
             setupKeyboardView()
             currentNightMode = newNightMode
         }
-
     }
 
+    /**
+     * キーボードビューのセットアップを行います。
+     * テーマ（特にDynamic Colors）を適用し、レイアウトをインフレートしてリスナーを設定します。
+     */
     private fun setupKeyboardView() {
         Timber.d("setupKeyboardView: Called")
-        // Determine the correct, themed context
+        // 正しいテーマが適用されたContextを取得
         val isDynamicColorsEnable = DynamicColors.isDynamicColorAvailable()
         val ctx = if (isDynamicColorsEnable) {
-            DynamicColors.wrapContextIfAvailable(
-                this, // Use 'this' (the service context), not applicationContext
-                R.style.Theme_MarkdownKeyboard
-            )
+            DynamicColors.wrapContextIfAvailable(this, R.style.Theme_MarkdownKeyboard)
         } else {
             ContextThemeWrapper(this, R.style.Theme_MarkdownKeyboard)
         }
 
-        // Inflate the new layout
+        // 新しいレイアウトをインフレート
         mainLayoutBinding = MainLayoutBinding.inflate(LayoutInflater.from(ctx))
 
-        // Ensure the container is not null and add the new view to it
+        // コンテナに新しいビューを追加
         keyboardContainer?.let { container ->
-            container.removeAllViews() // Remove the old keyboard view
+            container.removeAllViews() // 古いキーボードビューを削除
             mainLayoutBinding?.root?.let { newRootView ->
-                container.addView(newRootView) // Add the newly inflated view
+                container.addView(newRootView) // 新しくインフレートしたビューを追加
 
-                // All your listener and setup code goes here
+                // リスナーとセットアップコード
                 mainLayoutBinding?.let { mainView ->
+                    // Dynamic Colorsが有効な場合、背景リソースを設定
                     if (isDynamicColorsEnable) {
                         mainView.apply {
                             root.setBackgroundResource(com.kazumaproject.core.R.drawable.keyboard_root_material)
@@ -676,34 +784,34 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
                             suggestionVisibility.setBackgroundResource(com.kazumaproject.core.R.drawable.recyclerview_size_button_bg_material)
                         }
                     }
-                    setupCustomKeyboardListeners(mainView)
-                    setSuggestionRecyclerView(
+                    // 各種キーボードと候補表示ビューのリスナーとセットアップ
+                    setupCustomKeyboardListeners(mainView) // カスタムキーボードリスナー
+                    setSuggestionRecyclerView( // 候補表示ビュー
                         mainView,
-                        FlexboxLayoutManager(applicationContext).apply {
-                            flexDirection = FlexDirection.COLUMN
-                        },
-                        FlexboxLayoutManager(applicationContext).apply {
-                            flexDirection = FlexDirection.ROW
-                            justifyContent = JustifyContent.FLEX_START
-                        })
-                    setSymbolKeyboard(mainView)
-                    setQWERTYKeyboard(mainView)
-                    if (isTablet == true) {
+                        FlexboxLayoutManager(applicationContext).apply { flexDirection = FlexDirection.COLUMN },
+                        FlexboxLayoutManager(applicationContext).apply { flexDirection = FlexDirection.ROW; justifyContent = JustifyContent.FLEX_START }
+                    )
+                    setSymbolKeyboard(mainView) // シンボルキーボード
+                    setQWERTYKeyboard(mainView) // QWERTYキーボード
+                    if (isTablet == true) { // タブレット用キーボード
                         setTabletKeyListeners(mainView)
-                    } else {
+                    } else { // テンキー
                         setTenKeyListeners(mainView)
                     }
 
-                    // Restore UI state after recreation
-                    setKeyboardSize()
-                    updateClipboardPreview()
-                    mainLayoutBinding?.suggestionRecyclerView?.isVisible =
-                        suggestionViewStatus.value
+                    // UI状態の復元
+                    setKeyboardSize() // キーボードサイズ
+                    updateClipboardPreview() // クリップボードプレビュー
+                    mainLayoutBinding?.suggestionRecyclerView?.isVisible = suggestionViewStatus.value // 候補表示状態
                 }
             }
         }
     }
 
+    /**
+     * テキスト選択範囲やカーソル位置が変更されたときに呼び出されます。
+     * クリップボードのプレビュー表示や、未確定文字列(`stringInTail`)の処理を行います。
+     */
     override fun onUpdateSelection(
         oldSelStart: Int,
         oldSelEnd: Int,
@@ -718,61 +826,52 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
 
         Timber.d("onUpdateSelection: $oldSelStart $oldSelEnd $newSelStart $newSelEnd $candidatesStart $candidatesEnd")
 
-        // Skip if composing text is active
+        // 変換中のテキストがある場合は処理をスキップ
         if (candidatesStart != -1 || candidatesEnd != -1) return
 
-        // Show clipboard preview only if nothing was deleted and clipboard has data
+        // クリップボードプレビューの表示制御
         suggestionAdapter?.apply {
-            if (deletedBuffer.isEmpty()) {
-                // getPrimaryClipContentでクリップボードの内容を取得
-                when (val item = clipboardUtil.getPrimaryClipContent()) {
-                    is ClipboardItem.Image -> {
-                        // 画像だった場合の処理
+            if (deletedBuffer.isEmpty()) { // 削除バッファが空（Undoの対象がない）の場合
+                when (val item = clipboardUtil.getPrimaryClipContent()) { // クリップボードの内容を取得
+                    is ClipboardItem.Image -> { // 画像の場合
                         setPasteEnabled(true)
-                        // ★新しいメソッドでBitmapをアダプターに渡す
-                        setClipboardImagePreview(item.bitmap)
+                        setClipboardImagePreview(item.bitmap) // 画像プレビューを設定
                     }
-
-                    is ClipboardItem.Text -> {
-                        // テキストだった場合の処理
+                    is ClipboardItem.Text -> { // テキストの場合
                         setPasteEnabled(true)
-                        setClipboardPreview(item.text)
+                        setClipboardPreview(item.text) // テキストプレビューを設定
                     }
-
-                    is ClipboardItem.Empty -> {
-                        // 空だった場合の処理
+                    is ClipboardItem.Empty -> { // 空の場合
                         setPasteEnabled(false)
-                        setClipboardPreview("") // 念のためプレビューもクリア
+                        setClipboardPreview("") // プレビューをクリア
                     }
                 }
-            } else {
+            } else { // 削除バッファに何かあれば貼り付けを無効に
                 setPasteEnabled(false)
             }
         }
 
+        // 未確定文字列(stringInTail)とカーソル位置に基づく処理
         val tail = stringInTail.get()
         val hasTail = tail.isNotEmpty()
-        val caretTop = newSelStart == 0 && newSelEnd == 0
+        val caretTop = newSelStart == 0 && newSelEnd == 0 // カーソルが先頭にあるか
 
         when {
-            // Caret at top and tail exists → clear everything
+            // カーソルが先頭にあり、かつ未確定文字列が存在する場合 → 全てクリア
             hasTail && caretTop -> {
                 stringInTail.set("")
                 if (_inputString.value.isNotEmpty()) {
                     _inputString.value = ""
                     setComposingText("", 0)
                 }
-                suggestionAdapter?.suggestions =
-                    emptyList() // avoid unnecessary allocations elsewhere
+                suggestionAdapter?.suggestions = emptyList()
             }
-
-            // Caret moved while tail exists → commit tail
+            // 未確定文字列が存在する状態でカーソルが移動した場合 → 未確定文字列をコミット
             hasTail -> {
                 _inputString.value = tail
                 stringInTail.set("")
             }
-
-            // No tail but still holding input → cleanup
+            // 未確定文字列がなく、入力中の文字列が残っている場合 → クリア
             _inputString.value.isNotEmpty() -> {
                 _inputString.value = ""
                 setComposingText("", 0)
@@ -780,165 +879,143 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
         }
     }
 
+    /**
+     * ハードウェアキーボードなどからのキー入力イベントを処理します。
+     * 主に日本語入力モードでの物理キーボード操作を想定しています。
+     */
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         mainLayoutBinding?.let { mainView ->
-
+            // 現在のキーボードの入力モードを取得
             when (mainView.keyboardView.currentInputMode.value) {
-                InputMode.ModeJapanese -> {
-                    val insertString = inputString.value
-                    val suggestions = suggestionAdapter?.suggestions ?: emptyList()
-                    val sb = StringBuilder()
+                InputMode.ModeJapanese -> { // 日本語入力モードの場合
+                    val insertString = inputString.value // 現在入力中の文字列
+                    val suggestions = suggestionAdapter?.suggestions ?: emptyList() // 現在の候補リスト
+                    val sb = StringBuilder() // 文字列操作用
 
                     Timber.d("onKeyDown: $event")
 
+                    // Shiftキーが押されている場合の処理 (主に記号入力)
                     event?.let { e ->
                         if (e.isShiftPressed) {
-                            val char = PhysicalShiftKeyCodeMap.keymap[keyCode]
+                            val char = PhysicalShiftKeyCodeMap.keymap[keyCode] // Shift + キーに対応する文字を取得
                             char?.let { c ->
+                                // 入力中の文字列に追記して更新
                                 if (insertString.isNotEmpty()) {
-                                    sb.append(
-                                        insertString
-                                    ).append(c)
-                                    _inputString.update {
-                                        sb.toString()
-                                    }
+                                    sb.append(insertString).append(c)
+                                    _inputString.update { sb.toString() }
                                 } else {
-                                    _inputString.update {
-                                        c.toString()
-                                    }
+                                    _inputString.update { c.toString() }
                                 }
-                                return true
+                                return true // イベント処理完了
                             }
-                            return super.onKeyDown(keyCode, event)
+                            return super.onKeyDown(keyCode, event) // 対応する文字がなければシステムのデフォルト処理
                         }
                     }
 
+                    // 各キーコードに対応する処理
                     when (keyCode) {
-                        KeyEvent.KEYCODE_DEL -> {
+                        KeyEvent.KEYCODE_DEL -> { // 削除キー
                             when {
-                                insertString.isNotEmpty() -> {
-                                    if (isHenkan.get()) {
-                                        cancelHenkanByLongPressDeleteKey()
+                                insertString.isNotEmpty() -> { // 入力中の文字列がある場合
+                                    if (isHenkan.get()) { // 変換中の場合
+                                        cancelHenkanByLongPressDeleteKey() // 変換をキャンセル
                                         return true
-                                    } else {
-                                        deleteStringCommon(insertString)
-                                        resetFlagsDeleteKey()
-                                        event?.let { e ->
-                                            romajiConverter.handleDelete(e)
-                                        }
+                                    } else { // 未変換の場合
+                                        deleteStringCommon(insertString) // 文字を削除
+                                        resetFlagsDeleteKey() // 関連フラグをリセット
+                                        event?.let { e -> romajiConverter.handleDelete(e) } // ローマ字コンバータにも削除を通知
                                         return true
                                     }
                                 }
-
-                                else -> return super.onKeyDown(keyCode, event)
+                                else -> return super.onKeyDown(keyCode, event) // 入力文字列がなければシステムのデフォルト処理
                             }
                         }
-
-                        KeyEvent.KEYCODE_SPACE -> {
-                            handleSpaceKeyClick(false, insertString, suggestions, mainView)
+                        KeyEvent.KEYCODE_SPACE -> { // スペースキー
+                            handleSpaceKeyClick(false, insertString, suggestions, mainView) // スペースキーのクリック処理
                             return true
                         }
-
-                        KeyEvent.KEYCODE_DPAD_LEFT -> {
-                            if (isHenkan.get()) {
-                                handleDeleteKeyInHenkan(suggestions, insertString)
+                        KeyEvent.KEYCODE_DPAD_LEFT -> { // 左カーソルキー
+                            if (isHenkan.get()) { // 変換中の場合
+                                handleDeleteKeyInHenkan(suggestions, insertString) // 変換中の削除処理 (候補移動など)
                                 return true
-                            } else {
-                                handleLeftKeyPress(
-                                    GestureType.Tap, insertString
-                                )
-                                romajiConverter.clear()
+                            } else { // 未変換の場合
+                                handleLeftKeyPress(GestureType.Tap, insertString) // 左カーソルキーの処理
+                                romajiConverter.clear() // ローマ字コンバータの状態をクリア
                             }
                             return true
                         }
-
-                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                            if (isHenkan.get() && suggestions.isNotEmpty()) {
-                                handleJapaneseModeSpaceKey(
-                                    mainView, suggestions, insertString
-                                )
+                        KeyEvent.KEYCODE_DPAD_RIGHT -> { // 右カーソルキー
+                            if (isHenkan.get() && suggestions.isNotEmpty()) { // 変換中で候補がある場合
+                                handleJapaneseModeSpaceKey(mainView, suggestions, insertString) // 候補選択処理 (スペースキーと同様)
                                 return true
-                            } else {
-                                actionInRightKeyPressed(
-                                    GestureType.Tap, insertString
-                                )
-                                romajiConverter.clear()
+                            } else { // 未変換または候補がない場合
+                                actionInRightKeyPressed(GestureType.Tap, insertString) // 右カーソルキーの処理
+                                romajiConverter.clear() // ローマ字コンバータの状態をクリア
                             }
                             return true
                         }
-
-                        KeyEvent.KEYCODE_ENTER -> {
-                            if (insertString.isNotEmpty()) {
-                                handleNonEmptyInputEnterKey(suggestions, mainView, insertString)
-                            } else {
-                                handleEmptyInputEnterKey(mainView)
+                        KeyEvent.KEYCODE_ENTER -> { // エンターキー
+                            if (insertString.isNotEmpty()) { // 入力中の文字列がある場合
+                                handleNonEmptyInputEnterKey(suggestions, mainView, insertString) // 文字列あり時のエンター処理
+                            } else { // 入力中の文字列がない場合
+                                handleEmptyInputEnterKey(mainView) // 文字列なし時のエンター処理
                             }
-                            romajiConverter.clear()
+                            romajiConverter.clear() // ローマ字コンバータの状態をクリア
                             return true
                         }
-
-                        KeyEvent.KEYCODE_BACK -> {
-                            return super.onKeyDown(keyCode, event)
+                        KeyEvent.KEYCODE_BACK -> { // バックキー
+                            return super.onKeyDown(keyCode, event) // システムのデフォルト処理
                         }
-
+                        // 英数字、記号キーの処理 (ローマ字入力)
                         in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z,
                         in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9,
-                        KeyEvent.KEYCODE_MINUS,
-                        KeyEvent.KEYCODE_EQUALS,
-                        KeyEvent.KEYCODE_LEFT_BRACKET,
-                        KeyEvent.KEYCODE_RIGHT_BRACKET,
-                        KeyEvent.KEYCODE_BACKSLASH,
-                        KeyEvent.KEYCODE_SEMICOLON,
-                        KeyEvent.KEYCODE_APOSTROPHE,
-                        KeyEvent.KEYCODE_COMMA,
-                        KeyEvent.KEYCODE_PERIOD,
-                        KeyEvent.KEYCODE_SLASH,
-                        KeyEvent.KEYCODE_GRAVE,
-                        KeyEvent.KEYCODE_AT,
-                        KeyEvent.KEYCODE_NUMPAD_DIVIDE,
-                        KeyEvent.KEYCODE_NUMPAD_MULTIPLY,
-                        KeyEvent.KEYCODE_NUMPAD_SUBTRACT,
-                        KeyEvent.KEYCODE_NUMPAD_ADD,
+                        KeyEvent.KEYCODE_MINUS, KeyEvent.KEYCODE_EQUALS,
+                        KeyEvent.KEYCODE_LEFT_BRACKET, KeyEvent.KEYCODE_RIGHT_BRACKET,
+                        KeyEvent.KEYCODE_BACKSLASH, KeyEvent.KEYCODE_SEMICOLON,
+                        KeyEvent.KEYCODE_APOSTROPHE, KeyEvent.KEYCODE_COMMA,
+                        KeyEvent.KEYCODE_PERIOD, KeyEvent.KEYCODE_SLASH,
+                        KeyEvent.KEYCODE_GRAVE, KeyEvent.KEYCODE_AT,
+                        KeyEvent.KEYCODE_NUMPAD_DIVIDE, KeyEvent.KEYCODE_NUMPAD_MULTIPLY,
+                        KeyEvent.KEYCODE_NUMPAD_SUBTRACT, KeyEvent.KEYCODE_NUMPAD_ADD,
                         KeyEvent.KEYCODE_NUMPAD_DOT -> {
                             event?.let { e ->
+                                // ローマ字コンバータでキーイベントを処理し、変換結果を取得
                                 romajiConverter.handleKeyEvent(e).let { romajiResult ->
+                                    // 入力中の文字列に変換結果を追記/置換して更新
                                     if (insertString.isNotEmpty()) {
-                                        sb.append(
-                                            insertString.dropLast((romajiResult.second))
-                                        ).append(romajiResult.first)
-                                        _inputString.update {
-                                            sb.toString()
-                                        }
+                                        sb.append(insertString.dropLast(romajiResult.second))
+                                            .append(romajiResult.first)
+                                        _inputString.update { sb.toString() }
                                     } else {
-                                        _inputString.update {
-                                            romajiResult.first
-                                        }
+                                        _inputString.update { romajiResult.first }
                                     }
                                 }
-                                return true
+                                return true // イベント処理完了
                             }
-                            return super.onKeyDown(keyCode, null)
+                            return super.onKeyDown(keyCode, null) // イベントがなければシステムのデフォルト処理
                         }
-
-                        else -> {
-                            return super.onKeyDown(keyCode, event)
+                        else -> { // その他のキー
+                            return super.onKeyDown(keyCode, event) // システムのデフォルト処理
                         }
-
                     }
                 }
-
-                else -> {
-                    return super.onKeyDown(keyCode, event)
+                else -> { // 日本語入力モード以外の場合
+                    return super.onKeyDown(keyCode, event) // システムのデフォルト処理
                 }
             }
         }
-        return super.onKeyDown(keyCode, event)
+        return super.onKeyDown(keyCode, event) // ビューバインディングがなければシステムのデフォルト処理
     }
 
+    /**
+     * テンキービューのリスナーを設定します。
+     * フリック入力と長押し入力のイベントを処理します。
+     */
     private fun setTenKeyListeners(
         mainView: MainLayoutBinding
     ) {
         mainView.keyboardView.apply {
+            // フリックリスナーの設定
             setOnFlickListener(object : FlickListener {
                 override fun onFlick(gestureType: GestureType, key: Key, char: Char?) {
                     Timber.d("Flick: $char $key $gestureType")
@@ -946,68 +1023,49 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
                     val sb = StringBuilder()
                     val suggestionList = suggestionAdapter?.suggestions ?: emptyList()
                     when (gestureType) {
-                        GestureType.Null -> {
-
-                        }
-
-                        GestureType.Down -> {
-                            when (vibrationTimingStr) {
-                                "both" -> {
-                                    vibrate()
-                                }
-
-                                "press" -> {
-                                    vibrate()
-                                }
-
-                                "release" -> {
-
-                                }
+                        GestureType.Null -> { /* 何もしない */ }
+                        GestureType.Down -> { // キー押下時
+                            when (vibrationTimingStr) { // バイブレーション設定に応じた処理
+                                "both", "press" -> vibrate()
+                                "release" -> { /* リリース時に振動 */ }
                             }
                         }
-
-                        GestureType.Tap -> {
+                        GestureType.Tap -> { // タップ時
                             handleTapAndFlick(
-                                key = key,
-                                char = char,
-                                insertString = insertString,
-                                sb = sb,
-                                isFlick = false,
-                                gestureType = gestureType,
-                                suggestions = suggestionList,
-                                mainView = mainView
+                                key = key, char = char, insertString = insertString, sb = sb,
+                                isFlick = false, gestureType = gestureType,
+                                suggestions = suggestionList, mainView = mainView
                             )
                         }
-
-
-                        else -> {
+                        else -> { // フリック時 (Up, Left, Right, Bottom)
                             handleTapAndFlick(
-                                key = key,
-                                char = char,
-                                insertString = insertString,
-                                sb = sb,
-                                isFlick = true,
-                                gestureType = gestureType,
-                                suggestions = suggestionList,
-                                mainView = mainView
+                                key = key, char = char, insertString = insertString, sb = sb,
+                                isFlick = true, gestureType = gestureType,
+                                suggestions = suggestionList, mainView = mainView
                             )
                         }
                     }
                 }
             })
+            // 長押しリスナーの設定
             setOnLongPressListener(object : LongPressListener {
                 override fun onLongPress(key: Key) {
-                    handleLongPress(key)
+                    handleLongPress(key) // 長押し処理の呼び出し
                     Timber.d("Long Press: $key")
                 }
             })
         }
     }
 
+    /**
+     * タブレット用キービューのリスナーを設定します。
+     * 基本的な処理はテンキービューと同様です。
+     */
     private fun setTabletKeyListeners(
         mainView: MainLayoutBinding
     ) {
         mainView.tabletView.apply {
+            // フリックリスナーの設定 (テンキーと同様)
             setOnFlickListener(object : FlickListener {
                 override fun onFlick(gestureType: GestureType, key: Key, char: Char?) {
                     Timber.d("Flick: $char $key $gestureType")
@@ -1015,55 +1073,31 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
                     val sb = StringBuilder()
                     val suggestionList = suggestionAdapter?.suggestions ?: emptyList()
                     when (gestureType) {
-                        GestureType.Null -> {
-
-                        }
-
+                        GestureType.Null -> {}
                         GestureType.Down -> {
                             when (vibrationTimingStr) {
-                                "both" -> {
-                                    vibrate()
-                                }
-
-                                "press" -> {
-                                    vibrate()
-                                }
-
-                                "release" -> {
-
-                                }
+                                "both", "press" -> vibrate()
+                                "release" -> {}
                             }
                         }
-
                         GestureType.Tap -> {
                             handleTapAndFlick(
-                                key = key,
-                                char = char,
-                                insertString = insertString,
-                                sb = sb,
-                                isFlick = false,
-                                gestureType = gestureType,
-                                suggestions = suggestionList,
-                                mainView = mainView
+                                key = key, char = char, insertString = insertString, sb = sb,
+                                isFlick = false, gestureType = gestureType,
+                                suggestions = suggestionList, mainView = mainView
                             )
                         }
-
                         else -> {
                             handleTapAndFlick(
-                                key = key,
-                                char = char,
-                                insertString = insertString,
-                                sb = sb,
-                                isFlick = true,
-                                gestureType = gestureType,
-                                suggestions = suggestionList,
-                                mainView = mainView
+                                key = key, char = char, insertString = insertString, sb = sb,
+                                isFlick = true, gestureType = gestureType,
+                                suggestions = suggestionList, mainView = mainView
                             )
                         }
                     }
                 }
-
             })
+            // 長押しリスナーの設定 (テンキーと同様)
             setOnLongPressListener(object : LongPressListener {
                 override fun onLongPress(key: Key) {
                     handleLongPress(key)
@@ -1072,29 +1106,27 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
         }
     }
 
+    /**
+     * テンキーおよびタブレットキーからのタップおよびフリック入力を処理する共通関数。
+     * キーの種類や入力モードに応じて、文字入力、特殊キー操作（エンター、削除など）を行います。
+     */
     private fun handleTapAndFlick(
-        key: Key,
-        char: Char?,
-        insertString: String,
-        sb: StringBuilder,
-        isFlick: Boolean,
-        gestureType: GestureType,
-        suggestions: List<Candidate>,
-        mainView: MainLayoutBinding
+        key: Key,                // 押されたキーの種類
+        char: Char?,             // 入力された文字 (フリックやタップで決定される文字)
+        insertString: String,    // 現在入力中の文字列
+        sb: StringBuilder,       // 文字列操作用のStringBuilder
+        isFlick: Boolean,        // フリック入力かどうか
+        gestureType: GestureType,// ジェスチャーの種類 (Tap, FlickLeftなど)
+        suggestions: List<Candidate>, // 現在の候補リスト
+        mainView: MainLayoutBinding // メインレイアウトのビューバインディング
     ) {
+        // バイブレーション処理 (設定に応じて)
         when (vibrationTimingStr) {
-            "both" -> {
-                vibrate()
-            }
-
-            "press" -> {
-
-            }
-
-            "release" -> {
-                vibrate()
-            }
+            "both", "release" -> vibrate()
+            "press" -> { /* 押下時に振動済み or 振動なし */ }
         }
+
+        // Undo関連の処理: 新しいキー入力があった場合、Undoバッファをクリア
         if (deletedBuffer.isNotEmpty() && !selectMode.value && key != Key.SideKeyDelete) {
             clearDeletedBuffer()
             suggestionAdapter?.setUndoEnabled(false)
@@ -1104,100 +1136,87 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
             suggestionAdapter?.setUndoEnabled(false)
             updateClipboardPreview()
         }
+
+        // キーの種類に応じた処理分岐
         when (key) {
-            Key.NotSelected -> {}
-            Key.SideKeyEnter -> {
+            Key.NotSelected -> { /* 何もしない */ }
+            Key.SideKeyEnter -> { // エンターキー
                 if (insertString.isNotEmpty()) {
                     handleNonEmptyInputEnterKey(suggestions, mainView, insertString)
                 } else {
                     handleEmptyInputEnterKey(mainView)
                 }
             }
-
-            Key.KeyDakutenSmall -> {
+            Key.KeyDakutenSmall -> { // 濁点/小文字キー
                 handleDakutenSmallLetterKey(
-                    sb = sb,
-                    isFlick = isFlick,
-                    char = char,
-                    insertString = insertString,
-                    mainView = mainView,
-                    gestureType = gestureType
+                    sb = sb, isFlick = isFlick, char = char, insertString = insertString,
+                    mainView = mainView, gestureType = gestureType
                 )
             }
-
-            Key.SideKeyCursorLeft -> {
-                if (!leftCursorKeyLongKeyPressed.get()) {
+            Key.SideKeyCursorLeft -> { // 左カーソルキー
+                if (!leftCursorKeyLongKeyPressed.get()) { // 長押し中でなければタップ処理
                     handleLeftCursor(gestureType, insertString)
                 }
+                // 長押し状態の解除と関連ジョブのキャンセル
                 onLeftKeyLongPressUp.set(true)
                 leftCursorKeyLongKeyPressed.set(false)
                 leftLongPressJob?.cancel()
                 leftLongPressJob = null
             }
-
-            Key.SideKeyCursorRight -> {
-                if (!rightCursorKeyLongKeyPressed.get()) {
+            Key.SideKeyCursorRight -> { // 右カーソルキー
+                if (!rightCursorKeyLongKeyPressed.get()) { // 長押し中でなければタップ処理
                     actionInRightKeyPressed(gestureType, insertString)
                 }
+                // 長押し状態の解除と関連ジョブのキャンセル
                 onRightKeyLongPressUp.set(true)
                 rightCursorKeyLongKeyPressed.set(false)
                 rightLongPressJob?.cancel()
                 rightLongPressJob = null
             }
-
-            Key.SideKeyDelete -> {
-                if (!isFlick) {
+            Key.SideKeyDelete -> { // 削除キー
+                if (!isFlick) { // フリックでなければタップ処理
                     if (!deleteKeyLongKeyPressed.get()) {
                         handleDeleteKeyTap(insertString, suggestions)
                     }
                 }
-                stopDeleteLongPress()
+                stopDeleteLongPress() // 長押し処理を停止
             }
-
-            Key.SideKeyInputMode -> {
-                setTenkeyIconsInHenkan(insertString, mainView)
+            Key.SideKeyInputMode -> { // 入力モード切替キー
+                setTenkeyIconsInHenkan(insertString, mainView) // 変換状態に応じてアイコンを更新
             }
-
-            Key.SideKeyPreviousChar -> {
+            Key.SideKeyPreviousChar -> { // 前候補/Undoキー
                 mainView.keyboardView.let {
                     when (it.currentInputMode.value) {
-                        is InputMode.ModeNumber -> {
-
-                        }
-
-                        else -> {
-                            if (!isFlick) setNextReturnInputCharacter(insertString)
+                        is InputMode.ModeNumber -> { /* 数字モードでは何もしない */ }
+                        else -> { // それ以外のモードでは
+                            if (!isFlick) setNextReturnInputCharacter(insertString) // フリックでなければ前候補処理
                         }
                     }
                 }
             }
-
-            Key.SideKeySpace -> {
-                if (cursorMoveMode.value) {
-                    _cursorMoveMode.update { false }
-                } else {
-                    if (!isSpaceKeyLongPressed) {
-                        val isHankaku = isFlick || hankakuPreference == true
+            Key.SideKeySpace -> { // スペースキー
+                if (cursorMoveMode.value) { // カーソル移動モードの場合
+                    _cursorMoveMode.update { false } // カーソル移動モードを解除
+                } else { // 通常のスペースキー処理
+                    if (!isSpaceKeyLongPressed) { // 長押し中でなければ
+                        val isHankaku = isFlick || hankakuPreference == true // 半角スペースにするか判定
                         handleSpaceKeyClick(isHankaku, insertString, suggestions, mainView)
                     }
                 }
-                isSpaceKeyLongPressed = false
+                isSpaceKeyLongPressed = false // 長押し状態をリセット
             }
-
-            Key.SideKeySymbol -> {
+            Key.SideKeySymbol -> { // シンボルキーボード表示キー
                 vibrate()
-                _keyboardSymbolViewState.value = !_keyboardSymbolViewState.value
+                _keyboardSymbolViewState.value = !_keyboardSymbolViewState.value // 表示状態をトグル
+                // 変換中の文字列などをクリア
                 stringInTail.set("")
                 finishComposingText()
                 setComposingText("", 0)
             }
-
-            else -> {
-                /** 選択モード **/
-                if (selectMode.value) {
-                    when (key) {
-                        /** コピー **/
-                        Key.KeyA -> {
+            else -> { // 文字キーなど、その他のキー
+                if (selectMode.value) { // 選択モード中の場合
+                    when (key) { // キーに応じた選択関連操作
+                        Key.KeyA -> { /* コピー */
                             val selectedText = getSelectedText(0)
                             if (!selectedText.isNullOrEmpty()) {
                                 clipboardUtil.setClipBoard(selectedText.toString())
@@ -1207,52 +1226,40 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
                                 }
                             }
                         }
-                        /** 切り取り **/
-                        Key.KeySA -> {
+                        Key.KeySA -> { /* 切り取り */
                             val selectedText = getSelectedText(0)
                             if (!selectedText.isNullOrEmpty()) {
                                 clipboardUtil.setClipBoard(selectedText.toString())
                                 suggestionAdapter?.apply {
                                     setPasteEnabled(true)
                                     setClipboardPreview(selectedText.toString())
-                                    sendKeyEvent(
-                                        KeyEvent(
-                                            KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL
-                                        )
-                                    )
+                                    sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL))
                                 }
                             }
                         }
-                        /** 全て選択 **/
-                        Key.KeyMA -> {
+                        Key.KeyMA -> { /* 全て選択 */
                             selectAllText()
                         }
-
-                        /** 共有 **/
-                        Key.KeyRA -> {
+                        Key.KeyRA -> { /* 共有 */
                             val selectedText = getSelectedText(0)
                             if (!selectedText.isNullOrEmpty()) {
                                 val sendIntent = Intent(Intent.ACTION_SEND).apply {
                                     type = "text/plain"
                                     putExtra(Intent.EXTRA_TEXT, selectedText.toString())
                                 }
-                                val chooser: Intent =
-                                    Intent.createChooser(sendIntent, "Share text via").apply {
-                                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                                    }
+                                val chooser = Intent.createChooser(sendIntent, "Share text via").apply {
+                                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                }
                                 startActivity(chooser)
                                 clearSelection()
                             }
                         }
-                        /** その他 **/
-                        else -> {
-
-                        }
+                        else -> { /* その他のキーは選択モードでは無視 */ }
                     }
-                } else {
-                    if (isFlick) {
+                } else { // 通常入力モードの場合
+                    if (isFlick) { // フリック入力
                         handleFlick(char, insertString, sb, mainView)
-                    } else {
+                    } else { // タップ入力
                         handleTap(char, insertString, sb, mainView)
                     }
                 }
@@ -1260,101 +1267,103 @@ class IMEService : InputMethodService(), LifecycleOwner, InputConnection,
         }
     }
 
+    /**
+     * フリック入力を処理します。
+     * 変換中の場合は変換を確定し、新しい文字を入力します。
+     */
     private fun handleFlick(
-        char: Char?, insertString: String, sb: StringBuilder, mainView: MainLayoutBinding
+        char: Char?, // フリックで入力された文字
+        insertString: String, // 現在入力中の文字列
+        sb: StringBuilder, // 文字列操作用
+        mainView: MainLayoutBinding // メインレイアウトのビューバインディング
     ) {
-        if (isHenkan.get()) {
+        if (isHenkan.get()) { // 変換中の場合
+            // 変換を終了し、ハイライトを解除
             suggestionAdapter?.updateHighlightPosition(-1)
             finishComposingText()
             setComposingText("", 0)
-            mainView.root.post {
-                isHenkan.set(false)
-                char?.let {
-                    sendCharFlick(
-                        charToSend = it, insertString = "", sb = sb
-                    )
+            mainView.root.post { // UIスレッドで実行
+                isHenkan.set(false) // 変換状態を解除
+                char?.let { // 入力文字があれば送信
+                    sendCharFlick(charToSend = it, insertString = "", sb = sb)
                 }
+                // 連続入力フラグを設定
                 isContinuousTapInputEnabled.set(true)
                 lastFlickConvertedNextHiragana.set(true)
             }
-        } else {
-            char?.let {
-                sendCharFlick(
-                    charToSend = it, insertString = insertString, sb = sb
-                )
+        } else { // 未変換の場合
+            char?.let { // 入力文字があれば送信
+                sendCharFlick(charToSend = it, insertString = insertString, sb = sb)
             }
+            // 連続入力フラグを設定
             isContinuousTapInputEnabled.set(true)
             lastFlickConvertedNextHiragana.set(true)
         }
     }
 
+    /**
+     * タップ入力を処理します。
+     * 変換中の場合は変換を確定し、新しい文字を入力します。
+     */
     private fun handleTap(
-        char: Char?, insertString: String, sb: StringBuilder, mainView: MainLayoutBinding
+        char: Char?, // タップで入力された文字
+        insertString: String, // 現在入力中の文字列
+        sb: StringBuilder, // 文字列操作用
+        mainView: MainLayoutBinding // メインレイアウトのビューバインディング
     ) {
-        if (isHenkan.get()) {
+        if (isHenkan.get()) { // 変換中の場合
+            // 変換を終了し、ハイライトを解除
             suggestionAdapter?.updateHighlightPosition(-1)
             finishComposingText()
             setComposingText("", 0)
-            mainView.root.post {
-                isHenkan.set(false)
-                char?.let {
-                    sendCharTap(
-                        charToSend = it, insertString = "", sb = sb
-                    )
+            mainView.root.post { // UIスレッドで実行
+                isHenkan.set(false) // 変換状態を解除
+                char?.let { // 入力文字があれば送信
+                    sendCharTap(charToSend = it, insertString = "", sb = sb)
                 }
             }
-        } else {
-            char?.let {
-                sendCharTap(
-                    charToSend = it, insertString = insertString, sb = sb
-                )
+        } else { // 未変換の場合
+            char?.let { // 入力文字があれば送信
+                sendCharTap(charToSend = it, insertString = insertString, sb = sb)
             }
         }
     }
 
-    private fun handleLongPress(
-        key: Key
-    ) {
+    /**
+     * キーの長押しイベントを処理します。
+     * キーの種類に応じて、カーソル移動の連続実行、削除の連続実行、スペースキーの特殊操作などを行います。
+     */
+    private fun handleLongPress(key: Key) {
         when (key) {
             Key.NotSelected -> {}
-            Key.SideKeyEnter -> {}
-            Key.KeyDakutenSmall -> {}
-            Key.SideKeyCursorLeft -> {
-                handleLeftLongPress()
-                leftCursorKeyLongKeyPressed.set(true)
-                if (selectMode.value) {
-                    clearDeletedBufferWithoutResetLayout()
-                } else {
-                    clearDeletedBuffer()
-                }
+            Key.SideKeyEnter -> {} // エンターキー長押しは現在未定義
+            Key.KeyDakutenSmall -> {} // 濁点/小文字キー長押しは現在未定義
+            Key.SideKeyCursorLeft -> { // 左カーソルキー長押し
+                handleLeftLongPress() // 左カーソル連続移動処理を開始
+                leftCursorKeyLongKeyPressed.set(true) // 長押し状態フラグをセット
+                // Undoバッファのクリア
+                if (selectMode.value) clearDeletedBufferWithoutResetLayout() else clearDeletedBuffer()
                 suggestionAdapter?.setUndoEnabled(false)
                 updateClipboardPreview()
             }
-
-            Key.SideKeyCursorRight -> {
-                handleRightLongPress()
-                rightCursorKeyLongKeyPressed.set(true)
-                if (selectMode.value) {
-                    clearDeletedBufferWithoutResetLayout()
-                } else {
-                    clearDeletedBuffer()
-                }
+            Key.SideKeyCursorRight -> { // 右カーソルキー長押し
+                handleRightLongPress() // 右カーソル連続移動処理を開始
+                rightCursorKeyLongKeyPressed.set(true) // 長押し状態フラグをセット
+                // Undoバッファのクリア
+                if (selectMode.value) clearDeletedBufferWithoutResetLayout() else clearDeletedBuffer()
                 suggestionAdapter?.setUndoEnabled(false)
                 updateClipboardPreview()
             }
-
-            Key.SideKeyDelete -> {
-                handleDeleteLongPress()
+            Key.SideKeyDelete -> { // 削除キー長押し
+                handleDeleteLongPress() // 連続削除処理を開始
             }
-
-            Key.SideKeyInputMode -> {}
-            Key.SideKeyPreviousChar -> {}
-            Key.SideKeySpace -> {
-                handleSpaceLongAction()
+            Key.SideKeyInputMode -> {} // 入力モード切替キー長押しは現在未定義
+            Key.SideKeyPreviousChar -> {} // 前候補キー長押しは現在未定義
+            Key.SideKeySpace -> { // スペースキー長押し
+                handleSpaceLongAction() // スペースキー長押し時の特殊アクション (カタカナ変換/カーソル移動モード)
             }
-
-            Key.SideKeySymbol -> {}
-            else -> {}
+            Key.SideKeySymbol -> {} // シンボルキー長押しは現在未定義
+            else -> {} // その他のキー長押しは現在未定義
         }
     }
 
